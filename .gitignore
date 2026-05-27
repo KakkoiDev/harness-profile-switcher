@@ -1,0 +1,14 @@
+# Ignore all .md files by default
+*.md
+
+# Except these specific files
+!README.md
+!CONTRIBUTING.md
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+
+# Test scratch
+/tmp/
