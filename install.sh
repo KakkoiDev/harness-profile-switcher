@@ -1,19 +1,19 @@
 #!/bin/sh
-# claude-code-profiles installer
-# Installs the ccp binary
+# harness-profile-switcher installer
+# Installs the hps binary
 set -e
 
-VERSION="1.0.0"
-REPO_URL="https://raw.githubusercontent.com/KakkoiDev/claude-code-profiles/main"
+VERSION="2.0.0"
+REPO_URL="https://raw.githubusercontent.com/KakkoiDev/harness-profile-switcher/main"
 
 # Detect local vs remote (curl | sh) mode
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
-if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/ccp" ]; then
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/hps" ]; then
   LOCAL_MODE=1
-  CCP_SOURCE="$SCRIPT_DIR/ccp"
+  HPS_SOURCE="$SCRIPT_DIR/hps"
 else
   LOCAL_MODE=0
-  CCP_SOURCE=""
+  HPS_SOURCE=""
 fi
 
 # Defaults
@@ -39,19 +39,19 @@ die()   { error "$1"; exit 1; }
 
 usage() {
   cat <<EOF
-claude-code-profiles installer v${VERSION}
+harness-profile-switcher installer v${VERSION}
 
 Usage: ./install.sh [OPTIONS]
 
 Options:
   --dir PATH        Install directory (default: ~/.local/bin or /usr/local/bin)
-  --init            Run 'ccp init' after install (migrates existing ~/.claude config)
+  --init            Run 'hps init' after install (migrates existing config)
   --skip-deps       Skip dependency checks
-  --uninstall       Remove ccp
+  --uninstall       Remove hps
   --help            Show this help
 
 Examples:
-  ./install.sh                # Install ccp only
+  ./install.sh                # Install hps only
   ./install.sh --init         # Install and migrate existing config
   ./install.sh --dir ~/bin    # Install to custom directory
   ./install.sh --uninstall    # Remove
@@ -99,7 +99,8 @@ check_deps() {
   fi
 
   if ! command -v claude >/dev/null 2>&1; then
-    warn "claude CLI not found. 'ccp install' will fail until Claude Code is installed."
+    warn "claude CLI not found. 'hps install' (claude harness) will fail until Claude Code is installed."
+    warn "The pi harness ('hps --harness pi') does not need claude."
   fi
 }
 
@@ -114,18 +115,18 @@ download() {
   fi
 }
 
-install_ccp() {
+install_hps() {
   mkdir -p "$INSTALL_DIR"
 
   if [ "$LOCAL_MODE" = 1 ]; then
-    cp "$CCP_SOURCE" "$INSTALL_DIR/ccp"
+    cp "$HPS_SOURCE" "$INSTALL_DIR/hps"
   else
-    info "Downloading ccp from GitHub..."
-    download "$REPO_URL/ccp" "$INSTALL_DIR/ccp"
+    info "Downloading hps from GitHub..."
+    download "$REPO_URL/hps" "$INSTALL_DIR/hps"
   fi
 
-  chmod +x "$INSTALL_DIR/ccp"
-  info "Installed ccp to $INSTALL_DIR/ccp"
+  chmod +x "$INSTALL_DIR/hps"
+  info "Installed hps to $INSTALL_DIR/hps"
 
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
@@ -139,15 +140,15 @@ install_ccp() {
 uninstall() {
   resolve_install_dir
 
-  if [ -f "$INSTALL_DIR/ccp" ]; then
-    rm "$INSTALL_DIR/ccp"
-    info "Removed $INSTALL_DIR/ccp"
+  if [ -f "$INSTALL_DIR/hps" ]; then
+    rm "$INSTALL_DIR/hps"
+    info "Removed $INSTALL_DIR/hps"
   else
-    warn "ccp not found at $INSTALL_DIR/ccp"
+    warn "hps not found at $INSTALL_DIR/hps"
   fi
 
-  warn "Profile data at ~/.claude-profiles was not touched."
-  warn "Symlinks in ~/.claude still point into profile dirs."
+  warn "Profile data (~/.claude-profiles/ or ~/.pi-agent-profiles/) was not touched."
+  warn "Symlinks in ~/.claude/ or ~/.pi/agent/ still point into profile dirs."
   warn "Remove manually if desired."
 
   info "Uninstall complete"
@@ -160,14 +161,15 @@ fi
 
 resolve_install_dir
 check_deps
-install_ccp
+install_hps
 
 if [ "$RUN_INIT" = 1 ]; then
-  info "Running ccp init..."
-  "$INSTALL_DIR/ccp" init
+  info "Running hps init..."
+  "$INSTALL_DIR/hps" init
 fi
 
-info "ccp v${VERSION} installed successfully"
+info "hps v${VERSION} installed successfully"
 if [ "$RUN_INIT" != 1 ]; then
-  info "Next: run 'ccp init' to migrate existing ~/.claude config into profile 'main'"
+  info "Next: run 'hps init' to migrate existing ~/.claude config into profile 'main'"
+  info "For pi: run 'hps --harness pi init'"
 fi
