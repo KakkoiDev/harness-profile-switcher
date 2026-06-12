@@ -1,0 +1,779 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="2.0.0"
+
+# ═══════════════════════════════════════════════════════════════
+# Harness selection
+# ═══════════════════════════════════════════════════════════════
+
+_resolve_harness() {
+    if [ -n "${HPS_HARNESS:-}" ]; then
+        echo "$HPS_HARNESS"
+        return
+    fi
+    if [ -d "$HOME/.pi/agent" ] && [ ! -d "$HOME/.claude" ]; then
+        echo "pi"
+    elif [ -d "$HOME/.claude" ]; then
+        echo "claude"
+    else
+        echo "claude"
+    fi
+}
+
+HARNESS="${HPS_HARNESS:-$(_resolve_harness)}"
+
+# Scan args for --harness override (consumed before main dispatch)
+_ARGS=()
+_skip_next=0
+_next_is_harness=0
+for _arg in "$@"; do
+    if [ $_skip_next -eq 1 ]; then
+        _skip_next=0
+        if [ $_next_is_harness -eq 1 ]; then
+            HARNESS="$_arg"
+            _next_is_harness=0
+        fi
+        continue
+    fi
+    case "$_arg" in
+        --harness=*)
+            HARNESS="${_arg#*=}"
+            ;;
+        --harness)
+            _skip_next=1
+            _next_is_harness=1
+            ;;
+        *)
+            _ARGS+=("$_arg")
+            ;;
+    esac
+done
+set -- "${_ARGS[@]}"
+
+# ═══════════════════════════════════════════════════════════════
+# Harness definitions
+# ═══════════════════════════════════════════════════════════════
+
+case "$HARNESS" in
+    claude)
+        CONFIG_DIR="${HPS_CONFIG_DIR:-$HOME/.claude}"
+        PROFILES_DIR="${HPS_PROFILES_DIR:-$HOME/.claude-profiles}"
+        MANAGED_ITEMS=(agents skills plugins commands CLAUDE.md settings.json settings.local.json)
+        HAS_INSTALL=true
+        ;;
+    pi)
+        CONFIG_DIR="${HPS_CONFIG_DIR:-$HOME/.pi/agent}"
+        PROFILES_DIR="${HPS_PROFILES_DIR:-$HOME/.pi-agent-profiles}"
+        MANAGED_ITEMS=(extensions skills prompts themes AGENTS.md settings.json)
+        HAS_INSTALL=false
+        ;;
+    *)
+        echo "Unknown harness: $HARNESS (valid: claude, pi)"
+        exit 1
+        ;;
+esac
+
+# Deprecation warnings for old env var names
+if [ -n "${CCP_CLAUDE_DIR:-}" ]; then
+    echo "Warning: CCP_CLAUDE_DIR is deprecated, use HPS_CONFIG_DIR" >&2
+    CONFIG_DIR="$CCP_CLAUDE_DIR"
+fi
+if [ -n "${CCP_PROFILES_DIR:-}" ]; then
+    echo "Warning: CCP_PROFILES_DIR is deprecated, use HPS_PROFILES_DIR" >&2
+    PROFILES_DIR="$CCP_PROFILES_DIR"
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# Helper: predict a file item from its name (no dot = dir)
+# ═══════════════════════════════════════════════════════════════
+
+_is_file_item() {
+    case "$1" in
+        *.*) return 0 ;;
+        *)   return 1 ;;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Audit helpers — harness-aware profile comparison
+# ═══════════════════════════════════════════════════════════════
+
+# Compare skills/ directories (shared across harnesses)
+_audit_skills() {
+    local target_dir="$1" other_dir="$2"
+    local output=""
+    if [ -d "$other_dir/skills" ] && [ -d "$target_dir/skills" ]; then
+        local missing=""
+        for skill in "$other_dir/skills"/*/; do
+            [ -d "$skill" ] || continue
+            local sname
+            sname=$(basename "$skill")
+            if [ ! -e "$target_dir/skills/$sname" ]; then
+                local tag=""; [ -f "$skill/SKILL.md" ] && tag=" (ICM skill)" || tag=""
+                missing+="  $sname$tag\\n"
+            fi
+        done
+        if [ -n "$missing" ]; then
+            output="### Skills\\n$missing\\n"
+        fi
+    fi
+    echo -e "$output"
+}
+
+# Compare a directory of same-type files (agents/, prompts/, themes/, plugins/)
+_audit_dir_of_type() {
+    local target="$1" other="$2" ext="$3" label="$4" note="$5"
+    local output=""
+    if [ -d "$other" ] && [ -d "$target" ]; then
+        local missing=""
+        for f in "$other"/*."$ext"; do
+            [ -f "$f" ] 2>/dev/null || continue
+            local fname
+            fname=$(basename "$f")
+            if [ ! -f "$target/$fname" ]; then
+                local name_no_ext="${fname%."$ext"}"
+                missing+="  $name_no_ext ($note)\\n"
+            fi
+        done
+        if [ -n "$missing" ]; then
+            output="### $label\\n$missing\\n"
+        fi
+    fi
+    echo -e "$output"
+}
+
+# Compare extensions/ (pi only — .ts AND .js files)
+_audit_extensions() {
+    local target_dir="$1" other_dir="$2"
+    local output=""
+    if [ -d "$other_dir/extensions" ] && [ -d "$target_dir/extensions" ]; then
+        local missing=""
+        for ext in "$other_dir/extensions"/*.ts "$other_dir/extensions"/*.js; do
+            [ -f "$ext" ] 2>/dev/null || continue
+            local ename
+            ename=$(basename "$ext")
+            if [ ! -f "$target_dir/extensions/$ename" ]; then
+                missing+="  $ename (extension — candidate for skill conversion)\\n"
+            fi
+        done
+        if [ -n "$missing" ]; then
+            output="### Extensions\\n$missing\\n"
+        fi
+    fi
+    echo -e "$output"
+}
+
+# Write MISSING_SKILLS.md for a profile
+_write_missing_skills() {
+    local profile="$1"
+    local audit_output="$2"
+    local target_dir="$PROFILES_DIR/$profile"
+    local outfile="$target_dir/MISSING_SKILLS.md"
+
+    # Capture existing manual notes (after "## Adaptation Notes")
+    local manual_notes=""
+    if [ -f "$outfile" ]; then
+        manual_notes=$(sed -n '/^## Adaptation Notes/,$ p' "$outfile" 2>/dev/null)
+    fi
+
+    # Write header + generated audit
+    {
+        echo "# Missing Skills — $profile profile"
+        echo ""
+        echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "Harness: $HARNESS"
+        echo ""
+        echo "This file tracks skills/agents/extensions that exist in other profiles"
+        echo "and should be adapted for this profile."
+        echo ""
+        printf '%b' "$audit_output"
+        echo ""
+        if [ -n "$manual_notes" ]; then
+            printf '%s\\n' "$manual_notes"
+        else
+            echo "## Adaptation Notes"
+            echo ""
+            echo "(Add manual notes here. This section is preserved across regenerations.)"
+        fi
+    } > "$outfile"
+
+    echo "Wrote MISSING_SKILLS.md to $outfile"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Profile isolation audit
+# ═══════════════════════════════════════════════════════════════
+
+_verify_isolation() {
+    local profile_name="$1"
+    local warnings=0
+
+    # 1. Check each managed item is a symlink → correct profile
+    for item in "${MANAGED_ITEMS[@]}"; do
+        local target="$CONFIG_DIR/$item"
+        if [ -L "$target" ]; then
+            local resolved
+            resolved=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$target" 2>/dev/null)
+            local expected_dir
+            expected_dir=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$PROFILES_DIR/$profile_name" 2>/dev/null)
+            case "$resolved" in
+                "$expected_dir"/*) ;;
+                *)
+                    echo "Warning: $target points outside profile '$profile_name' ($resolved)" >&2
+                    warnings=$((warnings + 1))
+                    ;;
+            esac
+        fi
+    done
+
+    # 2. Check for orphaned (non-managed) items in config dir
+    for entry in "$CONFIG_DIR"/*; do
+        [ -e "$entry" ] || continue
+        local ename
+        ename=$(basename "$entry")
+        local is_managed=false
+        for item in "${MANAGED_ITEMS[@]}"; do
+            [ "$ename" = "$item" ] && is_managed=true && break
+        done
+        if [ "$is_managed" = "false" ]; then
+            # Skip known non-managed items per harness
+            case "$HARNESS:$ename" in
+                claude:backups|claude:cache|claude:debug|claude:file-history|claude:history.jsonl|claude:.last-*|claude:hooks|claude:Code|claude:downloads) ;;
+                pi:sessions|pi:git|pi:npm|pi:trust.json|pi:keybindings.json|pi:models.json) ;;
+                *)
+                    echo "Note: Non-managed item in $CONFIG_DIR: $ename" >&2
+                    ;;
+            esac
+        fi
+    done
+
+    # 3. Pi-specific: warn if ~/.agents/skills/ items shadow profile skills
+    if [ "$HARNESS" = "pi" ] && [ -d "$HOME/.agents/skills" ]; then
+        for shared_skill in "$HOME/.agents/skills"/*/; do
+            [ -d "$shared_skill" ] || continue
+            local ssname
+            ssname=$(basename "$shared_skill")
+            if [ -d "$PROFILES_DIR/$profile_name/skills/$ssname" ]; then
+                echo "Note: ~/.agents/skills/$ssname shadows profile skill (both active)" >&2
+            fi
+        done
+    fi
+
+    if [ $warnings -gt 0 ]; then
+        echo "Run 'hps audit $profile_name' to compare against other profiles." >&2
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Usage
+# ═══════════════════════════════════════════════════════════════
+
+usage() {
+    case "$HARNESS" in
+        claude)
+            cat <<EOF
+harness-profile-switcher v${VERSION} - Switch Claude Code configurations
+
+Usage:
+  hps <profile>          Switch to profile
+  hps list               List available profiles
+  hps current            Show active profile
+  hps init               Setup on new machine or migrate existing config
+  hps install            Reinstall plugins for current profile
+  hps create <name>      Create empty profile
+  hps clone <src> <dst>  Clone profile
+  hps audit <profile>    Compare profile against others (show missing items)
+  hps audit <profile> --write-missing
+                         Generate MISSING_SKILLS.md for profile
+  hps --version          Show version
+  hps --help             Show this help
+
+Options:
+  --harness <name>       Harness to use (claude, pi). Default: $HARNESS
+
+Managed items:
+  agents/  skills/  plugins/  commands/
+  CLAUDE.md  settings.json  settings.local.json
+
+Layout:
+  ~/.claude-profiles/
+    main/
+      agents/ skills/ plugins/ commands/
+      CLAUDE.md settings.json settings.local.json
+    work/
+      ...
+
+  ~/.claude/<item> is a symlink to ~/.claude-profiles/<active>/<item>
+  Each profile is fully isolated (separate computer equivalent).
+  Project-level .claude/ config is unaffected by profile switching.
+
+Environment:
+  HPS_CONFIG_DIR        Override ~/.claude (for testing)
+  HPS_PROFILES_DIR      Override ~/.claude-profiles (for testing)
+  HPS_HARNESS           Harness name (claude, pi)
+  CCP_CLAUDE_DIR        Deprecated, use HPS_CONFIG_DIR
+  CCP_PROFILES_DIR      Deprecated, use HPS_PROFILES_DIR
+EOF
+            ;;
+        pi)
+            cat <<EOF
+harness-profile-switcher v${VERSION} - Switch pi coding agent configurations
+
+Usage:
+  hps <profile>          Switch to profile
+  hps list               List available profiles
+  hps current            Show active profile
+  hps init               Setup on new machine or migrate existing config
+  hps create <name>      Create empty profile
+  hps clone <src> <dst>  Clone profile
+  hps audit <profile>    Compare profile against others (show missing items)
+  hps audit <profile> --write-missing
+                         Generate MISSING_SKILLS.md for profile
+  hps --version          Show version
+  hps --help             Show this help
+
+Options:
+  --harness <name>       Harness to use (claude, pi). Default: $HARNESS
+
+Managed items:
+  extensions/  skills/  prompts/  themes/
+  AGENTS.md  settings.json
+
+Layout:
+  ~/.pi-agent-profiles/
+    main/
+      extensions/ skills/ prompts/ themes/
+      AGENTS.md settings.json
+    work/
+      ...
+
+  ~/.pi/agent/<item> is a symlink to ~/.pi-agent-profiles/<active>/<item>
+  Each profile is fully isolated.
+  Project-level .pi/ config is unaffected by profile switching.
+
+Pi-specific notes:
+  - No plugin install: extensions are symlinked as files.
+  - Pi auto-installs packages from settings.json on startup.
+  - Skills are managed at ~/.pi/agent/skills/ only. Project-level
+    .pi/skills/ and .agents/skills/ are unaffected.
+  - AGENTS.md (global context, managed) vs ./AGENTS.md or ./CLAUDE.md
+    (project-level, unmanaged).
+  - No agents/ or commands/ dirs; no settings.local.json.
+
+Environment:
+  HPS_CONFIG_DIR        Override ~/.pi/agent (for testing)
+  HPS_PROFILES_DIR      Override ~/.pi-agent-profiles (for testing)
+  HPS_HARNESS           Harness name (claude, pi)
+  CCP_CLAUDE_DIR        Deprecated, use HPS_CONFIG_DIR
+  CCP_PROFILES_DIR      Deprecated, use HPS_PROFILES_DIR
+EOF
+            ;;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════
+# current_profile -- detect active profile from symlinks
+# ═══════════════════════════════════════════════════════════════
+
+current_profile() {
+    local profiles_real
+    profiles_real=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$PROFILES_DIR")
+    for item in "${MANAGED_ITEMS[@]}"; do
+        local target="$CONFIG_DIR/$item"
+        if [ -L "$target" ]; then
+            local resolved
+            resolved=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$target")
+            case "$resolved" in
+                "$profiles_real"/*)
+                    echo "${resolved#"$profiles_real"/}" | cut -d/ -f1
+                    return 0
+                    ;;
+            esac
+        fi
+    done
+    echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_list
+# ═══════════════════════════════════════════════════════════════
+
+cmd_list() {
+    if [ ! -d "$PROFILES_DIR" ]; then
+        echo "No profiles directory. Run: hps init"
+        exit 1
+    fi
+
+    local current
+    current=$(current_profile)
+
+    for dir in "$PROFILES_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        local name
+        name=$(basename "$dir")
+
+        case "$HARNESS" in
+            claude)
+                local n_agents=0 n_skills=0
+                [ -d "$dir/agents" ] && n_agents=$(find "$dir/agents" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')
+                [ -d "$dir/skills" ] && n_skills=$(find "$dir/skills" -maxdepth 1 -type d ! -name skills | wc -l | tr -d ' ')
+                local marker="  "
+                [ "$name" = "$current" ] && marker="* "
+                echo "${marker}${name}  (${n_agents} agents, ${n_skills} skills)"
+                ;;
+            pi)
+                local n_ext=0 n_skills=0 n_prompts=0 n_themes=0
+                [ -d "$dir/extensions" ] && n_ext=$(find "$dir/extensions" -maxdepth 1 \( -name '*.ts' -o -name '*.js' \) | wc -l | tr -d ' ')
+                [ -d "$dir/skills" ] && n_skills=$(find "$dir/skills" -maxdepth 1 -type d ! -name skills | wc -l | tr -d ' ')
+                [ -d "$dir/prompts" ] && n_prompts=$(find "$dir/prompts" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')
+                [ -d "$dir/themes" ] && n_themes=$(find "$dir/themes" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')
+                local marker="  "
+                [ "$name" = "$current" ] && marker="* "
+                echo "${marker}${name}  (${n_ext} ext, ${n_skills} skills, ${n_prompts} prompts, ${n_themes} themes)"
+                ;;
+        esac
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_current
+# ═══════════════════════════════════════════════════════════════
+
+cmd_current() {
+    local current
+    current=$(current_profile)
+    if [ -n "$current" ]; then
+        echo "$current"
+    else
+        echo "No active profile"
+        exit 1
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_init
+# ═══════════════════════════════════════════════════════════════
+
+cmd_init() {
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$PROFILES_DIR"
+
+    # If main profile exists already, switch and install plugins (claude only)
+    if [ -d "$PROFILES_DIR/main" ]; then
+        cmd_switch "main"
+        _verify_isolation "main" || true
+        if [ "$HAS_INSTALL" = "true" ] && [ -f "$PROFILES_DIR/main/plugins/installed_plugins.json" ]; then
+            cmd_install
+        fi
+        echo ""
+        echo "Ready. Profile 'main' active."
+        return
+    fi
+
+    # First-time: migrate current config to main profile
+    mkdir -p "$PROFILES_DIR/main"
+
+    for item in "${MANAGED_ITEMS[@]}"; do
+        local source="$CONFIG_DIR/$item"
+        local dest="$PROFILES_DIR/main/$item"
+        if [ -e "$source" ] && [ ! -L "$source" ]; then
+            # Ensure parent dir exists for the mv (mv renames dirs, so don't
+            # pre-create the final path component)
+            mkdir -p "$(dirname "$dest")"
+            mv "$source" "$dest"
+            echo "Moved $item -> profiles/main/$item"
+        fi
+    done
+
+    cmd_switch "main"
+    _verify_isolation "main" || true
+    echo ""
+    echo "Initialized. Current config is now profile 'main'."
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_create
+# ═══════════════════════════════════════════════════════════════
+
+cmd_create() {
+    local name="$1"
+
+    if [ -d "$PROFILES_DIR/$name" ]; then
+        echo "Profile '$name' already exists."
+        exit 1
+    fi
+
+    for item in "${MANAGED_ITEMS[@]}"; do
+        if _is_file_item "$item"; then
+            mkdir -p "$PROFILES_DIR/$name"
+            touch "$PROFILES_DIR/$name/$item"
+        else
+            mkdir -p "$PROFILES_DIR/$name/$item"
+        fi
+    done
+
+    echo "Created profile: $name"
+    echo "  $PROFILES_DIR/$name/"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_clone
+# ═══════════════════════════════════════════════════════════════
+
+cmd_clone() {
+    local src="$1"
+    local dst="$2"
+
+    if [ ! -d "$PROFILES_DIR/$src" ]; then
+        echo "Source profile '$src' not found."
+        exit 1
+    fi
+    if [ -d "$PROFILES_DIR/$dst" ]; then
+        echo "Destination profile '$dst' already exists."
+        exit 1
+    fi
+
+    cp -a "$PROFILES_DIR/$src" "$PROFILES_DIR/$dst"
+    echo "Cloned: $src -> $dst"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_audit
+# ═══════════════════════════════════════════════════════════════
+
+cmd_audit() {
+    local profile="$1"
+    local write_missing="${2:-false}"
+    local target_dir="$PROFILES_DIR/$profile"
+
+    [ -d "$target_dir" ] || { echo "Profile '$profile' not found" >&2; exit 1; }
+
+    local output=""
+    output+="hps audit $profile (harness: $HARNESS)\n\n"
+
+    local found_any=false
+
+    for other in "$PROFILES_DIR"/*/; do
+        [ -d "$other" ] || continue
+        local other_name
+        other_name=$(basename "$other")
+        [ "$other_name" = "$profile" ] && continue
+
+        found_any=true
+        output+="## From '$other_name' profile\n\n"
+
+        # ── Skills (both harnesses) ──
+        local _sec
+        _sec="$(_audit_skills "$target_dir" "$other")"
+        [ -n "$_sec" ] && output+="$_sec\n\n"
+
+        case "$HARNESS" in
+            claude)
+                # ── Agents (claude only) ──
+                _sec="$(_audit_dir_of_type "$target_dir/agents" "$other/agents" "md" "Agents" "candidate for skill conversion")"
+                [ -n "$_sec" ] && output+="$_sec\n\n"
+                # ── Plugins (claude only) ──
+                _sec="$(_audit_dir_of_type "$target_dir/plugins" "$other/plugins" "json" "Plugins" "reinstall with hps install")"
+                [ -n "$_sec" ] && output+="$_sec\n\n"
+                ;;
+            pi)
+                # ── Extensions (pi only, .ts + .js) ──
+                _sec="$(_audit_extensions "$target_dir" "$other")"
+                [ -n "$_sec" ] && output+="$_sec\n\n"
+                # ── Prompts (pi only) ──
+                _sec="$(_audit_dir_of_type "$target_dir/prompts" "$other/prompts" "md" "Prompts" "can be copied")"
+                [ -n "$_sec" ] && output+="$_sec\n\n"
+                # ── Themes (pi only) ──
+                _sec="$(_audit_dir_of_type "$target_dir/themes" "$other/themes" "json" "Themes" "can be copied")"
+                [ -n "$_sec" ] && output+="$_sec\n\n"
+                ;;
+        esac
+    done
+
+    if [ "$found_any" = "false" ]; then
+        output+="(No other profiles to compare against)\n"
+    fi
+
+    output+="Run 'hps audit $profile --write-missing' to generate MISSING_SKILLS.md\n"
+    printf '%b' "$output"
+
+    if [ "$write_missing" = "true" ]; then
+        _write_missing_skills "$profile" "$output"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_install
+# ═══════════════════════════════════════════════════════════════
+
+cmd_install() {
+    if [ "$HAS_INSTALL" != "true" ]; then
+        echo "Profiles for the '$HARNESS' harness don't use plugin installation."
+        echo "Pi extensions, skills, prompts, and themes are symlinked as files."
+        echo "Pi auto-installs packages listed in settings.json on next startup."
+        exit 0
+    fi
+
+    local current
+    current=$(current_profile)
+    if [ -z "$current" ]; then
+        echo "No active profile. Switch to a profile first."
+        exit 1
+    fi
+
+    local plugins_json="$PROFILES_DIR/$current/plugins/installed_plugins.json"
+    if [ ! -f "$plugins_json" ]; then
+        echo "No installed_plugins.json in profile '$current'."
+        exit 1
+    fi
+
+    local plugins
+    plugins=$(python3 -c "
+import json, sys
+with open('$plugins_json') as f:
+    data = json.load(f)
+for key in data.get('plugins', {}):
+    entries = data['plugins'][key]
+    for entry in entries:
+        scope = entry.get('scope', 'user')
+        print(f'{key} {scope}')
+" 2>/dev/null)
+
+    if [ -z "$plugins" ]; then
+        echo "No plugins to install."
+        return
+    fi
+
+    echo "Installing plugins for profile '$current'..."
+    local installed=0 failed=0
+    while IFS=' ' read -r plugin scope; do
+        echo "  Installing $plugin (scope: $scope)..."
+        if claude plugin install "$plugin" --scope "$scope" 2>&1; then
+            installed=$((installed + 1))
+        else
+            echo "    Failed: $plugin"
+            failed=$((failed + 1))
+        fi
+    done <<< "$plugins"
+
+    # ICM runtime detection (claude harness only)
+    if [ "$HARNESS" = "claude" ]; then
+        local current
+        current=$(current_profile)
+        local has_icm=false
+        if [ -d "$PROFILES_DIR/$current/skills" ]; then
+            for skill_dir in "$PROFILES_DIR/$current/skills"/*/; do
+                if [ -f "$skill_dir/SKILL.md" ] && [ -d "$skill_dir/stages" ]; then
+                    has_icm=true
+                    break
+                fi
+            done
+        fi
+
+        if [ "$has_icm" = "true" ]; then
+            local icm_installer="$HOME/Code/icm-runtime/installer.sh"
+            if [ -f "$icm_installer" ]; then
+                echo "  Installing ICM runtime..."
+                bash "$icm_installer" 2>&1 || echo "    Warning: ICM installer failed"
+            else
+                echo "  Warning: ICM runtime installer not found at $icm_installer"
+                echo "  Clone icm-runtime to ~/Code/icm-runtime for ICM skill support."
+            fi
+        fi
+    fi
+
+    echo "Done. $installed installed, $failed failed."
+}
+
+# ═══════════════════════════════════════════════════════════════
+# cmd_switch
+# ═══════════════════════════════════════════════════════════════
+
+cmd_switch() {
+    local name="$1"
+    local profile_dir="$PROFILES_DIR/$name"
+
+    if [ ! -d "$profile_dir" ]; then
+        echo "Profile '$name' not found."
+        echo "Available:"
+        cmd_list 2>/dev/null || ls "$PROFILES_DIR" 2>/dev/null | tr '\n' ' '
+        exit 1
+    fi
+
+    local linked=()
+    local skipped=()
+
+    for item in "${MANAGED_ITEMS[@]}"; do
+        local target="$CONFIG_DIR/$item"
+        local source="$profile_dir/$item"
+
+        # Safety: refuse to overwrite non-symlink files
+        if [ -e "$target" ] && [ ! -L "$target" ]; then
+            echo "ERROR: $target exists and is not a symlink."
+            echo "Run 'hps init' first to migrate existing config."
+            exit 1
+        fi
+
+        # Remove old symlink
+        rm -f "$target"
+
+        # Create new symlink if profile has this item
+        if [ -e "$source" ]; then
+            # Ensure parent dir exists
+            mkdir -p "$(dirname "$target")"
+            ln -s "$source" "$target"
+            linked+=("$item")
+        else
+            skipped+=("$item")
+        fi
+    done
+
+    echo "Switched to: $name"
+    if [ ${#linked[@]} -gt 0 ]; then echo "  Linked: ${linked[*]}"; fi
+    if [ ${#skipped[@]} -gt 0 ]; then echo "  Skipped (not in profile): ${skipped[*]}"; fi
+    _verify_isolation "$name" || true
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Main dispatch
+# ═══════════════════════════════════════════════════════════════
+
+case "${1:-}" in
+    ""|-h|--help)
+        usage
+        ;;
+    --version|-V)
+        echo "hps v${VERSION} (harness: $HARNESS)"
+        ;;
+    list)
+        cmd_list
+        ;;
+    current)
+        cmd_current
+        ;;
+    init)
+        cmd_init
+        ;;
+    install)
+        cmd_install
+        ;;
+    create)
+        [ -z "${2:-}" ] && { echo "Usage: hps create <name>"; exit 1; }
+        cmd_create "$2"
+        ;;
+    audit)
+        audit_profile="${2:-}"
+        write_missing=false
+        [ "${3:-}" = "--write-missing" ] && write_missing=true
+        [ -z "$audit_profile" ] && { echo "Usage: hps audit <profile> [--write-missing]"; exit 1; }
+        cmd_audit "$audit_profile" "$write_missing"
+        ;;
+    clone)
+        [ -z "${2:-}" ] || [ -z "${3:-}" ] && { echo "Usage: hps clone <source> <dest>"; exit 1; }
+        cmd_clone "$2" "$3"
+        ;;
+    *)
+        cmd_switch "$1"
+        ;;
+esac
