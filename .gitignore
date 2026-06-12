@@ -4,6 +4,9 @@
 # Except these specific files
 !README.md
 !CONTRIBUTING.md
+!PI-ADD-SUPPORT-PLAN.md
+!PLAN-hps-improvements.md
+!PLAN-icm-focus-resilience.md
 
 # Temporary files
 *.tmp
@@ -12,3 +15,6 @@
 
 # Test scratch
 /tmp/
+
+# Backward compat symlink
+ccp
